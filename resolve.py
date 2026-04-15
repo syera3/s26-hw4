@@ -32,35 +32,68 @@ ROOT_SERVERS = ("198.41.0.4",
                 "202.12.27.33")
 
 QUERY_CACHE = {}
-NS_CACHE = {}
+NS_A_CACHE = {}
+ZONE_CACHE = {}
 
-def make_empty_response(target_name: dns.name.Name,
-                        qtype: dns.rdata.Rdata) -> dns.message.Message:
+
+def _make_empty_response(target_name: dns.name.Name,
+                         qtype: dns.rdata.Rdata) -> dns.message.Message:
     query = dns.message.make_query(target_name, qtype)
     return dns.message.make_response(query)
 
 
-def copy_response(response: dns.message.Message) -> dns.message.Message:
-    try:
-        return dns.message.from_wire(response.to_wire())
-    except Exception:
-        return response
-
-
-def cache_key(target_name: dns.name.Name,
-              qtype: dns.rdata.Rdata) -> tuple:
+def _cache_key(target_name: dns.name.Name,
+               qtype: dns.rdata.Rdata) -> tuple:
     return (str(target_name).lower(), int(qtype))
 
 
-def find_answer_type(response: dns.message.Message,
-                     qtype: dns.rdata.Rdata) -> bool:
+def _name_text(name) -> str:
+    return str(name).lower()
+
+
+def _send_query(server: str,
+                target_name: dns.name.Name,
+                qtype: dns.rdata.Rdata):
+    try:
+        query = dns.message.make_query(target_name, qtype)
+        query.flags &= ~0x0100
+        return dns.query.udp(query, server, 3)
+    except Exception:
+        return None
+
+
+def _get_best_known_servers(target_name: dns.name.Name) -> list:
+    best_zone = None
+    best_servers = None
+    best_len = -1
+
+    for zone_text in ZONE_CACHE:
+        try:
+            zone_name = dns.name.from_text(zone_text)
+            if target_name.is_subdomain(zone_name):
+                zone_len = len(zone_name.labels)
+                if zone_len > best_len:
+                    best_len = zone_len
+                    best_zone = zone_text
+                    best_servers = ZONE_CACHE[zone_text]
+        except Exception:
+            pass
+
+    if best_zone is not None and best_servers is not None:
+        return best_servers[:]
+
+    return list(ROOT_SERVERS)
+
+
+def _find_answer_type(response: dns.message.Message,
+                      qtype: dns.rdata.Rdata) -> bool:
     for rrset in response.answer:
         if rrset.rdtype == qtype:
             return True
     return False
 
 
-def find_cname_target(response: dns.message.Message):
+def _find_cname_target(response: dns.message.Message):
     for rrset in response.answer:
         if rrset.rdtype == dns.rdatatype.CNAME:
             for rdata in rrset:
@@ -68,25 +101,26 @@ def find_cname_target(response: dns.message.Message):
     return None
 
 
-def get_ns_names(response: dns.message.Message) -> list:
-    ns_names = []
+def _get_referral_info(response: dns.message.Message):
     for rrset in response.authority:
         if rrset.rdtype == dns.rdatatype.NS:
+            ns_names = []
             for rdata in rrset:
                 if rdata.target not in ns_names:
                     ns_names.append(rdata.target)
-    return ns_names
+            return rrset.name, ns_names
+    return None, []
 
 
-def get_glue_ips(response: dns.message.Message, ns_names: list) -> list:
+def _get_glue_ips(response: dns.message.Message, ns_names: list) -> list:
     wanted = []
     for ns_name in ns_names:
-        wanted.append(str(ns_name).lower())
+        wanted.append(_name_text(ns_name))
 
     ips = []
     for rrset in response.additional:
         if rrset.rdtype == dns.rdatatype.A:
-            rr_name = str(rrset.name).lower()
+            rr_name = _name_text(rrset.name)
             if rr_name in wanted:
                 for rdata in rrset:
                     ip = str(rdata)
@@ -95,13 +129,13 @@ def get_glue_ips(response: dns.message.Message, ns_names: list) -> list:
     return ips
 
 
-def resolve_ns_name(ns_name: dns.name.Name) -> list:
-    ns_text = str(ns_name).lower()
+def _resolve_ns_name(ns_name: dns.name.Name) -> list:
+    ns_text = _name_text(ns_name)
 
-    if ns_text in NS_CACHE:
-        return NS_CACHE[ns_text][:]
+    if ns_text in NS_A_CACHE:
+        return NS_A_CACHE[ns_text][:]
 
-    response = iterative_lookup(ns_name, dns.rdatatype.A)
+    response = _iterative_lookup(ns_name, dns.rdatatype.A)
     ips = []
 
     for rrset in response.answer:
@@ -111,36 +145,48 @@ def resolve_ns_name(ns_name: dns.name.Name) -> list:
                 if ":" not in ip and ip not in ips:
                     ips.append(ip)
 
-    NS_CACHE[ns_text] = ips[:]
+    NS_A_CACHE[ns_text] = ips[:]
     return ips
 
 
-def get_next_servers(response: dns.message.Message) -> list:
-    ns_names = get_ns_names(response)
-    if not ns_names:
-        return []
+def _store_zone_cache(zone_name: dns.name.Name, servers: list) -> None:
+    zone_text = _name_text(zone_name)
+    if zone_text not in ZONE_CACHE:
+        ZONE_CACHE[zone_text] = []
 
-    glue_ips = get_glue_ips(response, ns_names)
-    if glue_ips:
-        return glue_ips
-
-    next_servers = []
-    for ns_name in ns_names:
-        ips = resolve_ns_name(ns_name)
-        for ip in ips:
-            if ip not in next_servers:
-                next_servers.append(ip)
-
-    return next_servers
+    for server in servers:
+        if server not in ZONE_CACHE[zone_text]:
+            ZONE_CACHE[zone_text].append(server)
 
 
-def iterative_lookup(target_name: dns.name.Name,
-                     qtype: dns.rdata.Rdata) -> dns.message.Message:
-    key = cache_key(target_name, qtype)
+def _combine_cname_and_result(original_name: dns.name.Name,
+                              qtype: dns.rdata.Rdata,
+                              cname_response: dns.message.Message,
+                              final_response: dns.message.Message) -> dns.message.Message:
+    combined = _make_empty_response(original_name, qtype)
+
+    for rrset in cname_response.answer:
+        combined.answer.append(rrset)
+
+    for rrset in final_response.answer:
+        duplicate = False
+        for existing in combined.answer:
+            if existing == rrset:
+                duplicate = True
+                break
+        if not duplicate:
+            combined.answer.append(rrset)
+
+    return combined
+
+
+def _iterative_lookup(target_name: dns.name.Name,
+                      qtype: dns.rdata.Rdata) -> dns.message.Message:
+    key = _cache_key(target_name, qtype)
     if key in QUERY_CACHE:
-        return copy_response(QUERY_CACHE[key])
+        return QUERY_CACHE[key]
 
-    servers = list(ROOT_SERVERS)
+    servers = _get_best_known_servers(target_name)
     used_servers = set()
     last_response = None
 
@@ -152,52 +198,69 @@ def iterative_lookup(target_name: dns.name.Name,
                 continue
             used_servers.add(server)
 
-            try:
-                query = dns.message.make_query(target_name, qtype)
-                query.flags &= ~0x0100
-                response = dns.query.udp(query, server, 3)
-            except Exception:
+            response = _send_query(server, target_name, qtype)
+            if response is None:
                 continue
 
             last_response = response
 
-            if find_answer_type(response, qtype):
-                QUERY_CACHE[key] = copy_response(response)
-                return copy_response(response)
+            if response.rcode() == 3:
+                QUERY_CACHE[key] = response
+                return response
 
-            cname_target = find_cname_target(response)
+            if _find_answer_type(response, qtype):
+                QUERY_CACHE[key] = response
+                return response
+
+            cname_target = _find_cname_target(response)
             if cname_target is not None:
                 if qtype == dns.rdatatype.CNAME:
-                    QUERY_CACHE[key] = copy_response(response)
-                    return copy_response(response)
+                    QUERY_CACHE[key] = response
+                    return response
 
-                cname_response = iterative_lookup(cname_target, qtype)
-                final_response = make_empty_response(target_name, qtype)
+                final_response = _iterative_lookup(cname_target, qtype)
+                combined = _combine_cname_and_result(target_name, qtype,
+                                                     response, final_response)
+                QUERY_CACHE[key] = combined
+                return combined
 
-                for rrset in response.answer:
-                    final_response.answer.append(rrset)
+            zone_name, ns_names = _get_referral_info(response)
 
-                for rrset in cname_response.answer:
-                    final_response.answer.append(rrset)
+            if zone_name is None:
+                if len(response.answer) == 0:
+                    QUERY_CACHE[key] = response
+                    return response
+                QUERY_CACHE[key] = response
+                return response
 
-                QUERY_CACHE[key] = copy_response(final_response)
-                return final_response
+            glue_ips = _get_glue_ips(response, ns_names)
+            if len(glue_ips) > 0:
+                _store_zone_cache(zone_name, glue_ips)
+                for ip in glue_ips:
+                    if ip not in used_servers and ip not in next_servers:
+                        next_servers.append(ip)
+                continue
 
-            referral_servers = get_next_servers(response)
-            for ip in referral_servers:
-                if ip not in used_servers and ip not in next_servers:
-                    next_servers.append(ip)
+            resolved_ns_ips = []
+            for ns_name in ns_names:
+                ns_ips = _resolve_ns_name(ns_name)
+                for ip in ns_ips:
+                    if ip not in resolved_ns_ips:
+                        resolved_ns_ips.append(ip)
+
+            if len(resolved_ns_ips) > 0:
+                _store_zone_cache(zone_name, resolved_ns_ips)
+                for ip in resolved_ns_ips:
+                    if ip not in used_servers and ip not in next_servers:
+                        next_servers.append(ip)
 
         servers = next_servers
 
     if last_response is not None:
-        QUERY_CACHE[key] = copy_response(last_response)
-        return copy_response(last_response)
+        QUERY_CACHE[key] = last_response
+        return last_response
 
-    return make_empty_response(target_name, qtype)
-
-
-
+    return _make_empty_response(target_name, qtype)
 
 
 def collect_results(name: str) -> dict:
@@ -259,11 +322,10 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
-    
     try:
-        return iterative_lookup(target_name, qtype)
+        return _iterative_lookup(target_name, qtype)
     except Exception:
-        return make_empty_response(target_name, qtype)
+        return _make_empty_response(target_name, qtype)
 
 
 def print_results(results: dict) -> None:
@@ -272,14 +334,9 @@ def print_results(results: dict) -> None:
     program would.
     """
 
-    printed = False
     for rtype, fmt_str in FORMATS:
         for result in results.get(rtype, []):
             print(fmt_str.format(**result))
-            printed = True
-
-    if not printed:
-        print("no records found")
 
 
 def main():
@@ -295,10 +352,7 @@ def main():
                                  action="store_true")
     program_args = argument_parser.parse_args()
     for a_domain_name in program_args.name:
-        try:
-            print_results(collect_results(a_domain_name))
-        except Exception:
-            print("no records found")
+        print_results(collect_results(a_domain_name))
 
 if __name__ == "__main__":
     main()
