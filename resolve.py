@@ -32,48 +32,37 @@ ROOT_SERVERS = ("198.41.0.4",
                 "202.12.27.33")
 
 QUERY_CACHE = {}
-NS_A_CACHE = {}
-ZONE_CACHE = {}
+NS_IP_CACHE = {}
+ZONE_SERVER_CACHE = {}
 
 
-def _make_empty_response(target_name: dns.name.Name,
-                         qtype: dns.rdata.Rdata) -> dns.message.Message:
+def _empty_response(target_name: dns.name.Name,
+                    qtype: dns.rdata.Rdata) -> dns.message.Message:
     query = dns.message.make_query(target_name, qtype)
     return dns.message.make_response(query)
 
 
-def _cache_key(target_name: dns.name.Name,
-               qtype: dns.rdata.Rdata) -> tuple:
+def _key(target_name: dns.name.Name,
+         qtype: dns.rdata.Rdata) -> tuple:
     return (str(target_name).lower(), int(qtype))
 
 
-def _to_text(name) -> str:
+def _text(name) -> str:
     return str(name).lower()
 
 
-def _send_query(server: str,
-                target_name: dns.name.Name,
-                qtype: dns.rdata.Rdata):
-    try:
-        query = dns.message.make_query(target_name, qtype)
-        query.flags &= ~0x0100
-        return dns.query.udp(query, server, 3)
-    except Exception:
-        return None
-
-
-def _find_best_servers(target_name: dns.name.Name) -> list:
-    best_len = -1
+def _best_start_servers(target_name: dns.name.Name) -> list:
     best_servers = None
+    best_length = -1
 
-    for zone_text in ZONE_CACHE:
+    for zone_text in ZONE_SERVER_CACHE:
         try:
             zone_name = dns.name.from_text(zone_text)
             if target_name.is_subdomain(zone_name):
-                zone_len = len(zone_name.labels)
-                if zone_len > best_len:
-                    best_len = zone_len
-                    best_servers = ZONE_CACHE[zone_text]
+                current_length = len(zone_name.labels)
+                if current_length > best_length:
+                    best_length = current_length
+                    best_servers = ZONE_SERVER_CACHE[zone_text]
         except Exception:
             pass
 
@@ -83,15 +72,26 @@ def _find_best_servers(target_name: dns.name.Name) -> list:
     return list(ROOT_SERVERS)
 
 
-def _response_has_type(response: dns.message.Message,
-                       qtype: dns.rdata.Rdata) -> bool:
+def _send_query(server_ip: str,
+                target_name: dns.name.Name,
+                qtype: dns.rdata.Rdata):
+    try:
+        query = dns.message.make_query(target_name, qtype)
+        query.flags &= ~0x0100
+        return dns.query.udp(query, server_ip, 3)
+    except Exception:
+        return None
+
+
+def _has_qtype_answer(response: dns.message.Message,
+                      qtype: dns.rdata.Rdata) -> bool:
     for rrset in response.answer:
         if rrset.rdtype == qtype:
             return True
     return False
 
 
-def _get_cname_target(response: dns.message.Message):
+def _first_cname_target(response: dns.message.Message):
     for rrset in response.answer:
         if rrset.rdtype == dns.rdatatype.CNAME:
             for rdata in rrset:
@@ -99,66 +99,28 @@ def _get_cname_target(response: dns.message.Message):
     return None
 
 
-def _get_referral(response: dns.message.Message):
-    for rrset in response.authority:
-        if rrset.rdtype == dns.rdatatype.NS:
-            ns_names = []
-            for rdata in rrset:
-                if rdata.target not in ns_names:
-                    ns_names.append(rdata.target)
-            return rrset.name, ns_names
-    return None, []
-
-
-def _get_glue_ips(response: dns.message.Message, ns_names: list) -> list:
-    wanted = []
-    for ns_name in ns_names:
-        wanted.append(_to_text(ns_name))
-
-    ips = []
-    for rrset in response.additional:
-        if rrset.rdtype != dns.rdatatype.A:
-            continue
-        if _to_text(rrset.name) in wanted:
-            for rdata in rrset:
-                ip = str(rdata)
-                if ":" not in ip and ip not in ips:
-                    ips.append(ip)
-    return ips
-
-
-def _store_zone(zone_name: dns.name.Name, servers: list) -> None:
-    zone_text = _to_text(zone_name)
-    if zone_text not in ZONE_CACHE:
-        ZONE_CACHE[zone_text] = []
-
-    for server in servers:
-        if server not in ZONE_CACHE[zone_text]:
-            ZONE_CACHE[zone_text].append(server)
-
-
-def _combine_responses(original_name: dns.name.Name,
-                       qtype: dns.rdata.Rdata,
-                       first_response: dns.message.Message,
-                       second_response: dns.message.Message) -> dns.message.Message:
-    combined = _make_empty_response(original_name, qtype)
+def _combine_answers(original_name: dns.name.Name,
+                     qtype: dns.rdata.Rdata,
+                     first_response: dns.message.Message,
+                     second_response: dns.message.Message) -> dns.message.Message:
+    combined = _empty_response(original_name, qtype)
 
     for rrset in first_response.answer:
         combined.answer.append(rrset)
 
     for rrset in second_response.answer:
-        already_there = False
+        duplicate = False
         for existing in combined.answer:
             if existing == rrset:
-                already_there = True
+                duplicate = True
                 break
-        if not already_there:
+        if not duplicate:
             combined.answer.append(rrset)
 
     return combined
 
 
-def _extract_a_records(response: dns.message.Message) -> list:
+def _extract_a_ips(response: dns.message.Message) -> list:
     ips = []
     for rrset in response.answer:
         if rrset.rdtype == dns.rdatatype.A:
@@ -169,38 +131,76 @@ def _extract_a_records(response: dns.message.Message) -> list:
     return ips
 
 
-def _resolve_ns_host(ns_name: dns.name.Name) -> list:
-    ns_text = _to_text(ns_name)
+def _extract_referral(response: dns.message.Message):
+    for rrset in response.authority:
+        if rrset.rdtype == dns.rdatatype.NS:
+            ns_names = []
+            for rdata in rrset:
+                if rdata.target not in ns_names:
+                    ns_names.append(rdata.target)
+            return rrset.name, ns_names
+    return None, []
 
-    if ns_text in NS_A_CACHE:
-        return NS_A_CACHE[ns_text][:]
+
+def _extract_glue_ips(response: dns.message.Message, ns_names: list) -> list:
+    wanted = []
+    for ns_name in ns_names:
+        wanted.append(_text(ns_name))
+
+    ips = []
+    for rrset in response.additional:
+        if rrset.rdtype != dns.rdatatype.A:
+            continue
+        if _text(rrset.name) in wanted:
+            for rdata in rrset:
+                ip = str(rdata)
+                if ":" not in ip and ip not in ips:
+                    ips.append(ip)
+    return ips
+
+
+def _store_zone_servers(zone_name: dns.name.Name, server_ips: list) -> None:
+    zone_text = _text(zone_name)
+
+    if zone_text not in ZONE_SERVER_CACHE:
+        ZONE_SERVER_CACHE[zone_text] = []
+
+    for ip in server_ips:
+        if ip not in ZONE_SERVER_CACHE[zone_text]:
+            ZONE_SERVER_CACHE[zone_text].append(ip)
+
+
+def _resolve_ns_name_once(ns_name: dns.name.Name) -> list:
+    ns_text = _text(ns_name)
+
+    if ns_text in NS_IP_CACHE:
+        return NS_IP_CACHE[ns_text][:]
 
     response = _iterative_lookup(ns_name, dns.rdatatype.A)
-    ips = _extract_a_records(response)
-
-    NS_A_CACHE[ns_text] = ips[:]
+    ips = _extract_a_ips(response)
+    NS_IP_CACHE[ns_text] = ips[:]
     return ips
 
 
 def _iterative_lookup(target_name: dns.name.Name,
                       qtype: dns.rdata.Rdata) -> dns.message.Message:
-    key = _cache_key(target_name, qtype)
+    key = _key(target_name, qtype)
     if key in QUERY_CACHE:
         return QUERY_CACHE[key]
 
-    servers = _find_best_servers(target_name)
+    servers = _best_start_servers(target_name)
     used_servers = set()
     last_response = None
 
     while len(servers) > 0:
         next_servers = []
 
-        for server in servers:
-            if server in used_servers:
+        for server_ip in servers:
+            if server_ip in used_servers:
                 continue
 
-            used_servers.add(server)
-            response = _send_query(server, target_name, qtype)
+            used_servers.add(server_ip)
+            response = _send_query(server_ip, target_name, qtype)
 
             if response is None:
                 continue
@@ -211,49 +211,55 @@ def _iterative_lookup(target_name: dns.name.Name,
                 QUERY_CACHE[key] = response
                 return response
 
-            if _response_has_type(response, qtype):
+            if _has_qtype_answer(response, qtype):
                 QUERY_CACHE[key] = response
                 return response
 
-            cname_target = _get_cname_target(response)
+            cname_target = _first_cname_target(response)
             if cname_target is not None:
                 if qtype == dns.rdatatype.CNAME:
                     QUERY_CACHE[key] = response
                     return response
 
                 final_response = _iterative_lookup(cname_target, qtype)
-                combined = _combine_responses(target_name, qtype,
-                                              response, final_response)
+                combined = _combine_answers(target_name, qtype,
+                                            response, final_response)
                 QUERY_CACHE[key] = combined
                 return combined
 
-            zone_name, ns_names = _get_referral(response)
+            zone_name, ns_names = _extract_referral(response)
 
             if zone_name is None:
                 QUERY_CACHE[key] = response
                 return response
 
-            glue_ips = _get_glue_ips(response, ns_names)
+            glue_ips = _extract_glue_ips(response, ns_names)
             if len(glue_ips) > 0:
-                _store_zone(zone_name, glue_ips)
+                _store_zone_servers(zone_name, glue_ips)
                 for ip in glue_ips:
                     if ip not in used_servers and ip not in next_servers:
                         next_servers.append(ip)
                 continue
 
-            resolved_ips = []
+            # unglued case:
+            # resolve NS hostnames one at a time and immediately use any IPs found
+            found_ips = []
             for ns_name in ns_names:
-                ns_ips = _resolve_ns_host(ns_name)
+                ns_ips = _resolve_ns_name_once(ns_name)
                 if len(ns_ips) > 0:
                     for ip in ns_ips:
-                        if ip not in resolved_ips:
-                            resolved_ips.append(ip)
+                        if ip not in found_ips:
+                            found_ips.append(ip)
 
-            if len(resolved_ips) > 0:
-                _store_zone(zone_name, resolved_ips)
-                for ip in resolved_ips:
+                    # as soon as one NS resolves, use it right away
+                    break
+
+            if len(found_ips) > 0:
+                _store_zone_servers(zone_name, found_ips)
+                for ip in found_ips:
                     if ip not in used_servers and ip not in next_servers:
                         next_servers.append(ip)
+                continue
 
         servers = next_servers
 
@@ -261,7 +267,7 @@ def _iterative_lookup(target_name: dns.name.Name,
         QUERY_CACHE[key] = last_response
         return last_response
 
-    return _make_empty_response(target_name, qtype)
+    return _empty_response(target_name, qtype)
 
 
 def collect_results(name: str) -> dict:
@@ -326,7 +332,7 @@ def lookup(target_name: dns.name.Name,
     try:
         return _iterative_lookup(target_name, qtype)
     except Exception:
-        return _make_empty_response(target_name, qtype)
+        return _empty_response(target_name, qtype)
 
 
 def print_results(results: dict) -> None:
